@@ -12,31 +12,37 @@ import os
 import torch
 from parlai.agents.hugging_face.dict import Gpt2DictionaryAgent
 from parlai.core.torch_generator_agent import TorchGeneratorAgent, TorchGeneratorModel
+from parlai.core.torch_agent import TorchAgent, Batch, Output, DictionaryAgent
 from parlai.utils.io import PathManager
 from parlai.utils.misc import warn_once
-from parlai.utils.brown import BrownianBridgeLoss, BrownianLoss
 from parlai.utils.torch import IdentityLayer, padded_tensor
 
 import numpy as np
 from torch.nn import CrossEntropyLoss, MSELoss
 from transformers import (
-    GPT2Tokenizer
+    GPT2Tokenizer,
+    GPT2TimeLMHeadModel
+)
+from parlai.utils.torch import (
+    neginf,
+    IdentityLayer
 )
 from typing import Tuple
 from math import ceil
 
-from transformers import GPT2TimeModel, GPT2Model
+from transformers import GPT2TimeModel, GPT2Model, AutoTokenizer
 
 
 MAX_LENGTH = int(10000) 
 HIDDEN_DIM = 128
 
 def load_cl_model(filepath, latent_dim, base_model, use_section_ids,
-                  token_size):
+                  token_size, pad_idx=0):
     model = GPT2OUEncoder(
          hidden_dim=HIDDEN_DIM,
          latent_dim=latent_dim,
-         finetune_gpt2=False)
+         finetune_gpt2=False,
+         padding_idx=pad_idx)
     if use_section_ids:
         model.model.resize_token_embeddings(token_size)
 
@@ -63,22 +69,28 @@ def load_cl_model(filepath, latent_dim, base_model, use_section_ids,
         model.fc_mu = torch.nn.Linear(latent_dim, latent_dim)
         model.fc_var = torch.nn.Linear(latent_dim, latent_dim)
 
-    print(new_dict)
     model.load_state_dict(new_dict)
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
     return model
 
-def get_checkpoint(filepath, latent_dim, base_model="gpt2",
-                   sec_id=False, token_size=None,
-                ):
+def get_checkpoint(
+        filepath, 
+        latent_dim, 
+        base_model="gpt2",
+        sec_id=False, 
+        token_size=None,
+        pad_idx=0,
+    ):
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = load_cl_model(filepath,
                           latent_dim,
                           base_model,
                           use_section_ids=sec_id,
-                          token_size=token_size
+                          token_size=token_size,
+                          pad_idx=pad_idx
                           )
     model.to(device)
     model = model.eval()
@@ -119,6 +131,42 @@ def get_device_map(n_layers, devices):
     layers_list = list(layers[i : i + n_blocks] for i in range(0, n_layers, n_blocks))
 
     return dict(zip(devices, layers_list))
+
+def get_special_tokens(dataset_name, tokenizer, add_tokens=True):
+    SECTION_IDS = []
+    if "wikisection" == dataset_name:
+        SECTION_IDS = ['[ ABSTRACT ]', '[ HISTORY ]', '[ GEOGRAPHY ]', '[ DEMOGRAPHICS ]']
+    if 'recipe' in dataset_name:
+        SECTION_IDS = [
+            '[ TITLE ]',
+            '[ INGREDIENTS ]',
+            '[ DIRECTIONS ]'
+        ]
+    if 'tm2' in dataset_name or 'tickettalk' in dataset_name:
+        SECTION_IDS = [
+            '[ USER ]',
+            '[ ASSISTANT ]',
+        ]
+    if 'wikihow' in dataset_name:
+        SECTION_IDS = [
+            '[ TITLE ]',
+            '[ METHOD ]',
+            '[ STEP ]'
+        ]
+    SECTION_IDS += [' . ']
+    if add_tokens:
+        # NOTE loading previous tokenizer sometimes already includes the new tokens
+        eos = tokenizer(' . ')['input_ids']
+        print("Old tokenizer size: ", len(tokenizer))
+        if len(eos) == 1 and eos[0] == 50256 + len(SECTION_IDS):
+            print("Not adding because it's already contained")
+            pass # don't add cause it's already contained
+        else:
+            print("Adding tokens, ", SECTION_IDS)
+            tokenizer.add_tokens(SECTION_IDS)
+        print("New tokenizer size: ", len(tokenizer))
+    SPECIAL_TOKENS = [_[0] for _ in tokenizer(SECTION_IDS)['input_ids']]
+    return SECTION_IDS, SPECIAL_TOKENS, tokenizer
 
 def weights_init(m):
     if isinstance(m, torch.nn.Linear):
@@ -192,11 +240,12 @@ class GPT2OUEncoder(torch.nn.Module):
     Passes GPT-2 hidden states through linear layers for Brownian Bridge latent representations.
     '''
 
-    def __init__(self, hidden_dim, latent_dim, finetune_gpt2=False):
+    def __init__(self, hidden_dim, latent_dim, finetune_gpt2=False, padding_idx = None):
         super(GPT2OUEncoder, self).__init__()
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.finetune = finetune_gpt2
+        self.padding_idx = padding_idx
         self._init_model()
 
     def _init_model(self):
@@ -262,19 +311,24 @@ class GPT2OUEncoder(torch.nn.Module):
         z = self.feature_extractor(z)
         return z
 
-    def forward(self, input_ids, attention_mask):
-        gpt_emb = self.model(input_ids=input_ids, attention_mask=attention_mask)[0]
+    def get_attn_mask(self, tokens_tensor):
+        attn_mask = (tokens_tensor != self.padding_idx)
+        return attn_mask
+
+    def forward(self, input_ids):
+        attn_mask = self.get_attn_mask(input_ids)
+        gpt_emb = self.model(input_ids=input_ids, attention_mask=attn_mask)[0]
         # Index into the last hidden state of the sentence (last non-EOS token)
-        gpt_emb = self.compute_masked_means(gpt_emb, attention_mask)
+        gpt_emb = self.compute_masked_means(gpt_emb, attn_mask)
         # Albert lang embedding -> feature embedding space
         return self.projection(gpt_emb)
 
-
 class GPT2TimeDecoder(torch.nn.Module):
-    _keys_to_ignore_on_load_missing = [r"attn.masked_bias", r"attn.bias", r"lm_head.weight"]
-
     def __init__(self, opt, dict):
+        super().__init__()
         self.transformer = self._init_from_pretrained(opt)
+        
+        '''
         if opt["add_special_tokens"]:
             size_before = self.transformer.wte.weight.size(0)
             self.transformer.resize_token_embeddings(len(dict.hf_tokenizer))
@@ -285,6 +339,7 @@ class GPT2TimeDecoder(torch.nn.Module):
                 self.transformer.wte.weight[
                     size_before:
                 ] += self.transformer.wte.weight[size_before - 1].unsqueeze(0)
+        '''
 
         self.add_start_token = opt["add_start_token"]
         self.START_IDX = dict.start_idx
@@ -292,171 +347,71 @@ class GPT2TimeDecoder(torch.nn.Module):
         self.END_IDX = dict.end_idx
         # use cuda
         self.use_cuda = not opt["no_cuda"] and torch.cuda.is_available()
-
+    
     def _init_from_pretrained(self, opt):
-        # load model
-        if opt.get("decoder_model_name"):
-            fle_key = opt["decoder_model_name"]
-        else:
-            model_sz = opt["gpt2_size"]
-            if model_sz == "small":
-                model_key = "gpt2"
-            elif model_sz == "distilgpt2":
-                model_key = "distilgpt2"
-            else:
-                model_key = f"gpt2-{model_sz}"
+        return GPT2TimeLMHeadModel.from_pretrained(opt['decoder_model_name'])
 
-            # check if datapath has the files that hugging face code looks for
-            hf_dir = os.path.join(opt["datapath"], "hf", model_key)
-            if all(
-                PathManager.exists(os.path.join(hf_dir, file_name))
-                for file_name in ["pytorch_model.bin", "config.json"]
+    def forward(self, input, encoder_state, cl_feats, incr_state=None):                
+        attention_mask = None
+        position_ids = None
+        if incr_state is None:
+            # first step
+            if (
+                not self.add_start_token
+                and input.size(1) == 1
+                and int(input[0][0]) == self.START_IDX
             ):
-                fle_key = PathManager.get_local_path(hf_dir, recursive=True)
+                # generating: ignore the start token
+                # without deep copy, the padding_idx (-1) in encoder_state can be reset to 0 with clamp_ inplace operation
+                model_input = encoder_state.clone()
             else:
-                fle_key = model_key
-        return GPT2TimeModel.from_pretrained(fle_key)
-
-    def get_output_embeddings(self):
-        return self.lm_head
-
-    def set_output_embeddings(self, new_embeddings):
-        self.lm_head = new_embeddings
-
-    def prepare_inputs_for_generation(self, input_ids, past=None, **kwargs):
-        token_type_ids = kwargs.get("token_type_ids", None)
-        # only last token for inputs_ids if past is defined in kwargs
-        if past:
-            input_ids = input_ids[:, -1].unsqueeze(-1)
-            if token_type_ids is not None:
-                token_type_ids = token_type_ids[:, -1].unsqueeze(-1)
-
-        attention_mask = kwargs.get("attention_mask", None)
-        position_ids = kwargs.get("position_ids", None)
-
-        if attention_mask is not None and position_ids is None:
-            # create position_ids on the fly for batch generation
-            position_ids = attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(attention_mask == 0, 1)
-            if past:
-                position_ids = position_ids[:, -1].unsqueeze(-1)
+                # forced decoding: concatenate the context
+                # with the labels
+                model_input = torch.cat([encoder_state, input], dim=-1)
+            attention_mask = model_input != self.NULL_IDX
+            position_ids = (
+                attention_mask.cumsum(dim=-1, dtype=torch.int64) - 1
+            ).clamp_(min=0)
         else:
-            position_ids = None
-        result = {
-            "input_ids": input_ids,
-            "past_key_values": past,
-            "use_cache": kwargs.get("use_cache"),
-            "position_ids": position_ids,
-            "attention_mask": attention_mask,
-            "token_type_ids": token_type_ids,
-        }
+            if not self.add_start_token:
+                input = input[:, 1:]
+            # generating with continuation
+            # get the position ids
+            position_ids = (encoder_state != self.NULL_IDX).sum(
+                -1, True, dtype=torch.int64
+            ) - 1
+            delta = ((input != self.NULL_IDX)).sum(-1, True, dtype=torch.int64)
+            position_ids += delta
+            # generation: get the last token input
+            model_input = input[:, -1:]
+            attention_mask = torch.cat([encoder_state, input], dim=-1) != self.NULL_IDX
 
-        if 'section_ids' in kwargs:
-            result['section_ids']= kwargs['section_ids']
-        if 'raw_text' in kwargs:
-            result['raw_text']= kwargs['raw_text']
-        if 'cl_feats' in kwargs:
-            result['cl_feats']= kwargs['cl_feats']
-        if 'seq_cl_feats' in kwargs:
-            result['seq_cl_feats']= kwargs['seq_cl_feats']
-        if 'seq_section_ids' in kwargs:
-            result['seq_section_ids']= kwargs['seq_section_ids']
-
-        return result
-
-    def forward(
-        self,
-        input_ids=None,
-        raw_text=None,
-        seq_cl_feats=None,
-        seq_section_ids=None,
-        cl_feats=None,
-        section_ids=None,
-        past_key_values=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        labels=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
-
-        r"""
-        labels (:obj:`torch.LongTensor` of shape :obj:`(batch_size, sequence_length)`, `optional`):
-            Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
-            ``labels = input_ids`` Indices are selected in ``[-100, 0, ..., config.vocab_size]`` All labels set to
-            ``-100`` are ignored (masked), the loss is only computed for labels in ``[0, ..., config.vocab_size]``
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
+        model_input = model_input.clamp_(min=0)
         transformer_outputs = self.transformer(
-            input_ids,
-            raw_text=raw_text,
+            input_ids=model_input,
             cl_feats=cl_feats,
-            seq_cl_feats=seq_cl_feats,
-            seq_section_ids=seq_section_ids,
-            section_ids=section_ids,
-            past_key_values=past_key_values,
+            past_key_values=incr_state,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
             position_ids=position_ids,
-            head_mask=head_mask,
-            inputs_embeds=inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
         hidden_states = transformer_outputs[0]
+        new_incr_state = transformer_outputs[1]
 
-        # Set device for model parallelism
-        if self.model_parallel:
-            torch.cuda.set_device(self.transformer.first_device)
-            hidden_states = hidden_states.to(self.lm_head.weight.device)
+        if incr_state is None:
+            # pull out only the hidden states for the label tokens
+            output = hidden_states[:, -input.size(1) - 1 + int(self.add_start_token) :]
+            # hack: we need the last state of the encoder-side to be the first
+            # element of the decoder-side
+            lengths = (input != self.NULL_IDX).sum(dim=-1)
+            for i in range(input.size(0)):
+                output[i, input.size(1) - lengths[i]] = output[i, 0]
 
-        lm_logits = self.lm_head(hidden_states)
+        else:
+            # generation, we're only doing one token at a time. no need to
+            # shove things back in
+            output = hidden_states
 
-        loss = None
-        if labels is not None:
-            # Shift so that tokens < n predict n
-            shift_logits = lm_logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-            # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
-            loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
-
-        if not return_dict:
-            output = (lm_logits,) + transformer_outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return CausalLMOutputWithCrossAttentions(
-            loss=loss,
-            logits=lm_logits,
-            past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
-            attentions=transformer_outputs.attentions,
-            cross_attentions=transformer_outputs.cross_attentions,
-        )
-
-    @staticmethod
-    def _reorder_cache(past: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor) -> Tuple[Tuple[torch.Tensor]]:
-        """
-        This function is used to re-order the :obj:`past_key_values` cache if
-        :meth:`~transformers.PreTrainedModel.beam_search` or :meth:`~transformers.PreTrainedModel.beam_sample` is
-        called. This is required to match :obj:`past_key_values` with the correct beam_idx at every generation step.
-        """
-        return tuple(
-            tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
-            for layer_past in past
-        )
+        return output, new_incr_state
 
 class BrownianGPT2Model(TorchGeneratorModel):
     """
@@ -464,32 +419,42 @@ class BrownianGPT2Model(TorchGeneratorModel):
     """
 
     def __init__(self, opt, dict):
-        print(opt.items())
         self.add_start_token = opt["add_start_token"]
         super().__init__(*self._get_special_tokens(opt, dict))
 
         # init the model
-        self.encoder = self._get_encoder(opt, dict)
+        self.tokenizer = AutoTokenizer.from_pretrained('gpt2')
+        self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        SECTION_IDS, SPECIAL_TOKENS, self.tokenizer = get_special_tokens(
+            dataset_name=opt['dataset_name'], tokenizer=self.tokenizer)
+        token_size = len(self.tokenizer)
+
+        self.encoder = IdentityLayer()
+        self.cl_encoder = self._get_encoder(opt, token_size=token_size)
         self.decoder = self._get_decoder(opt, dict)
         self.config = self.decoder.transformer.config
-        self.lm_head = torch.nn.Linear(
-            self.config.n_embd, self.config.vocab_size, bias=False
-        )
-        self._tie_weights(self.lm_head, self.decoder.transformer.wte)
+        
         # add start token
-
         # temporary fix to manually retrieve pre-computed Gaussian estimate
         # TO-DO : decide how to get Gaussian estimate for last sentence in an interactive mode.
         import pickle
         with open(opt['gaussian_path'], 'rb') as f:
             self.first_sent_mu, self.first_sent_dev, self.last_sent_mu, self.last_sent_dev = pickle.load(f)
 
-    def _get_encoder(self, opt, dict):
+    def _get_encoder(self, opt, token_size):
         model_path = opt['encoder_model_name']
         latent_dim = opt['encoder_latent_dim']
-        return get_checkpoint(model_path, latent_dim)
+        return get_checkpoint(
+            model_path, 
+            latent_dim,
+            sec_id=True,
+            token_size=token_size,
+            pad_idx=self.tokenizer.pad_token_id
+        )
 
     def _get_decoder(self, opt, dict):
+        assert 'decoder_model_name' in opt.keys()
         return GPT2TimeDecoder(opt, dict)
 
     def _tie_weights(self, output_embeddings, input_embeddings):
@@ -502,11 +467,11 @@ class BrownianGPT2Model(TorchGeneratorModel):
         enc = torch.index_select(encoder_states, 0, indices)
         return enc
 
-    def output(self, tensor):
-        """
-        Compute output logits.
-        """
-        return self.lm_head(tensor)
+    #def output(self, tensor):
+    #    """
+    #    Compute output logits.
+    #    """
+    #    return self.lm_head(tensor)
 
     def reorder_decoder_incremental_state(self, incremental_state, inds):
         new_incr_state = []
@@ -616,6 +581,11 @@ class BrownianAgent(TorchGeneratorAgent):
             required=True,
         )
         agent.add_argument(
+            '--dataset_name',
+            type=str,
+            required=True,
+        )
+        agent.add_argument(
             "--gaussian-path",
             type=str,
         )
@@ -681,6 +651,109 @@ class BrownianAgent(TorchGeneratorAgent):
         return padded_tensor(
             items, pad_idx=self.NULL_IDX, left_padded=True, fp16friendly=False
         )
+
+    def _generate(
+        self,
+        batch: Batch,
+        beam_size: int,
+        max_ts: int,
+        prefix_tokens: Optional[torch.LongTensor] = None,
+    ):
+        
+        model = self.model
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model = self.model.module
+        encoder_states = model.encoder(*self._encoder_input(batch))
+        # get Brownian embedding
+        cl_encoder = self.model.cl_encoder
+        cl_feats = cl_encoder(*self._encoder_input(batch))
+        
+        if batch.text_vec is not None:
+            dev = batch.text_vec.device
+        else:
+            assert batch.label_vec is not None, "need label_vec for _generate"
+            dev = batch.label_vec.device
+
+        bsz = batch.batchsize
+        if batch.text_vec is not None:
+            batchsize = batch.batchsize
+            batch_context_list = self._get_batch_context(batch)
+            beams = [
+                self._treesearch_factory(dev, verbose=self.show_token_details)
+                .set_batch_context(
+                    batch_context_list,
+                    batch_idx,
+                    self.opt.get('gpu_beam_blocking', False),
+                )
+                .set_block_list(self.beam_block_list)
+                for batch_idx in range(batchsize)
+            ]
+        else:
+            beams = [
+                self._treesearch_factory(dev, verbose=self.show_token_details)
+                for _ in range(bsz)
+            ]
+        # repeat encoder outputs and decoder inputs
+        decoder_input = self._get_initial_decoder_input(bsz, beam_size, dev)
+
+        inds = torch.arange(bsz).to(dev).unsqueeze(1).repeat(1, beam_size).view(-1)
+        encoder_states = model.reorder_encoder_states(encoder_states, inds)
+        incr_state = None
+
+        for _ts in range(max_ts):
+            if all((b.is_done() for b in beams)):
+                # exit early if possible
+                break
+
+            score, incr_state = model.decoder(decoder_input, encoder_states, cl_feats, incr_state)
+            # only need the final hidden state to make the word prediction
+            score = score[:, -1:, :]
+            # score contains softmax scores for bsz * beam_size samples
+            score = score.view(bsz, beam_size, -1)
+            if self.temperature != 1.0:
+                score.div_(self.temperature)
+            # force to fp32 to avoid overflow issues during search calculations
+            score = self._generation_activation(score)  # type: ignore
+            if prefix_tokens is not None and _ts < prefix_tokens.size(1):
+                # generate prefix_tokens for every timestep that they exist
+                # achieve by setting score of all other tokens to be -inf
+                prefix_toks = prefix_tokens[:, _ts]
+                prefix_mask = torch.ones_like(score, dtype=torch.bool)
+                prefix_mask[
+                    :, :, prefix_toks
+                ] = False  # everything except prefix toks should be neginf
+                score[prefix_mask] = neginf(score.dtype)
+            for i, b in enumerate(beams):
+                if not b.is_done():
+                    b.advance(score[i], _ts)
+            incr_state_inds = torch.cat(
+                [
+                    beam_size * i + b.get_backtrack_from_current_step()
+                    for i, b in enumerate(beams)
+                ]
+            )
+            incr_state = model.reorder_decoder_incremental_state(
+                incr_state, incr_state_inds
+            )
+            selection = torch.cat(
+                [b.get_output_from_current_step() for b in beams]
+            ).unsqueeze(-1)
+            decoder_input = self._get_next_decoder_input(
+                decoder_input, selection, incr_state_inds
+            )
+
+        # get all finalized candidates for each sample (and validate them)
+        n_best_beam_preds_scores = [b.get_rescored_finished() for b in beams]
+
+        if hasattr(self, '_rerank_beams'):
+            n_best_beam_preds_scores = self._rerank_beams(  # type: ignore
+                batch, n_best_beam_preds_scores
+            )
+
+        # get the top prediction for each beam (i.e. minibatch sample)
+        beam_preds_scores = [n_best_list[0] for n_best_list in n_best_beam_preds_scores]
+
+        return beam_preds_scores, beams
 
     def load_state_dict(self, state_dict):
         # 2020-11-10: some very old transformer model points (pre v3.0.1) are

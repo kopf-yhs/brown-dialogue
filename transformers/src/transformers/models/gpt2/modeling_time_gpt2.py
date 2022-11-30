@@ -26,7 +26,8 @@ from torch import nn
 from torch.nn import CrossEntropyLoss, MSELoss
 
 from transformers import (
-    GPT2Tokenizer
+    GPT2Tokenizer,
+    GPT2Model
 )
 
 from ...activations import ACT2FN
@@ -831,7 +832,6 @@ class GPT2TimeModel(GPT2PreTrainedModel):
         output_hidden_states=None,
         return_dict=None,
     ):
-
         # fulldoc & wikisection
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
