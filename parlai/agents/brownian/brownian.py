@@ -13,6 +13,7 @@ import torch
 from parlai.agents.hugging_face.dict import Gpt2DictionaryAgent
 from parlai.core.torch_generator_agent import TorchGeneratorAgent, TorchGeneratorModel
 from parlai.core.torch_agent import TorchAgent, Batch, Output, DictionaryAgent
+from parlai.core.brownian import BrownianBridgeLoss
 from parlai.utils.io import PathManager
 from parlai.utils.misc import warn_once
 from parlai.utils.torch import IdentityLayer, padded_tensor
@@ -754,6 +755,63 @@ class BrownianAgent(TorchGeneratorAgent):
         beam_preds_scores = [n_best_list[0] for n_best_list in n_best_beam_preds_scores]
 
         return beam_preds_scores, beams
+
+    ### TO-DO : Enable training on ParlAI framework
+
+    #def compute_loss(self, batch, batch_idx, return_output=False):
+    #    torch.cuda.empty_cache()
+    #    obs_0 = batch['y_0']
+    #    obs_t = batch['y_t']
+    #    obs_T = batch['y_T']
+    #    t_s = batch['t_'].float()
+    #    ts = batch['t'].float()
+    #    Ts = batch['T'].float()
+    #    feats_0 = self.get_feats(obs_0)
+    #    feats_t = self.get_feats(obs_t)
+    #    feats_T = self.get_feats(obs_T)
+    #    log_q_y_tp1 = self.model.get_log_q(feats_t)
+    #    loss_fn = brownian_bridge.BrownianBridgeLoss(
+    #        z_0=feats_0,
+    #        z_t=feats_t,
+    #        z_T=feats_T,
+    #        t_=t_s,
+    #        t=ts,
+    #        T=Ts,
+    #        alpha=0,
+    #        var=0,
+    #        log_q_y_T=log_q_y_tp1,
+    #        loss_type=self.config.loss_params.name,
+    #        eps=self.config.model_params.eps,
+    #        max_seq_len=batch['total_t'].float(),
+    #    )
+    #    loss = loss_fn.get_loss()
+    #    return loss
+
+    #def train_step(self, batch, batch_idx):
+    #    loss = self.compute_loss(batch, batch_idx)
+    #    return loss
+
+    #def test_step(self, batch, i):
+    #    loss = self.get_losses_for_batch(batch=batch, batch_idx=i)
+    #    wandb.log({'test_loss': loss.cpu().detach().numpy(),
+    #               'epoch': self.trainer.current_epoch})
+    #    self.log('test_loss', float(loss.cpu().detach().numpy()), prog_bar=True, on_step=True)
+    #    return loss
+
+    #def forward(self, input_ids, attention_mask):
+    #    feats = self.model.forward(input_ids=input_ids, attention_mask=attention_mask)
+    #    return feats
+
+    #def get_feats(self, obs):
+    #    input_ids_i, attention_mask_i = self.train_dataset.tokenize_caption(
+    #        obs, device=self.device)
+    #    input_ids_i = input_ids_i[:, :self.train_dataset.max_length]
+    #    attention_mask_i = attention_mask_i[:, :self.train_dataset.max_length]
+    #    feats_i = self.forward(input_ids=input_ids_i, attention_mask=attention_mask_i)
+    #    return feats_i
+
+    #def compute_loss(self, batch, return_output=False):
+    #    pass
 
     def load_state_dict(self, state_dict):
         # 2020-11-10: some very old transformer model points (pre v3.0.1) are
